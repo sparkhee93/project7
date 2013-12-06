@@ -1,0 +1,631 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+FILE *file;
+int container[65536];
+int reg[8];
+#define PC reg[4]
+#define PSW reg[5]
+#define SP reg[6]
+#define SPL reg[7]
+int linkBit = 0;
+int currentVal;
+long long time = 0;
+int tempPC;
+int jump = 0;
+int skipFlag = 0;
+int indirectFlag;
+int verboseFlag;
+char commands[27];
+char regs[150];
+int oldPC;
+
+/* regIndex function */
+char * whichReg(int regIndex) {
+  if(regIndex == 0) return "A";
+  if(regIndex == 1) return "B";
+  if(regIndex == 2) return "C";
+  if(regIndex == 3) return "D";
+  if(regIndex == 4) return "PC";
+  if(regIndex == 5) return "PSW";
+  if(regIndex == 6) return "SP";
+  if(regIndex == 7) return "SPL";
+}
+
+/* regs */
+void regsFunction(int value1, int value2, int value1_type, int value2_type, int regIndex) {
+  char temp[20];
+  if(value1_type == 1) { /* memory */
+    if(strlen(regs) > 1) {
+      strcat(regs, ", ");
+    }
+    sprintf(temp, "M[0x%04X] -> ", value1);
+    strcat(regs, temp);
+  }
+  if(value1_type == 2) { /* register */
+    if(strlen(regs) > 1) {
+      strcat(regs, ", ");
+    }
+    strcat(temp, whichReg(regIndex));
+    strcat(temp, " -> ");
+    strcat(regs, temp);
+  }
+  if(value1_type == 3) { /* value */
+    if(strlen(regs) > 1) {
+      strcat(regs, ", ");
+    }
+    sprintf(temp, "0x%04X -> ", value1);
+    strcat(regs, temp);
+  }
+  temp[0] = '\0';
+  if(value2_type == 1) { /* memory */
+    sprintf(temp, "M[0x%04X] ", value2);
+    strcat(regs, temp);
+  }
+  if(value2_type == 2) { /* register */
+    strcat(temp, whichReg(regIndex));
+    strcat(regs, temp);
+  }
+  if(value2_type == 3) { /* value */
+    sprintf(temp, "0x%04X ", value2);
+    strcat(regs, temp);
+  }
+}
+
+/*  Opcode  */
+int findOpcode(int val) {
+  return (val >> 12) & 0x000F;
+}
+
+/*  Verbose  */
+void printIfVerbose() {
+  if(verboseFlag == 1) {
+    fprintf(stderr, "Time %3lld: PC=0x%04X instruction = 0x%04X (%s)",
+                    time, oldPC, currentVal, commands);
+    if (regs != NULL)
+      fprintf(stderr, ": %s", regs);
+    fprintf(stderr, "\n");
+  }
+}
+
+/* Register Concatenation */
+void regConcat(int regIndex) {
+  switch(regIndex) {
+    case 0:
+      strcat(commands, "A");
+      break;
+    case 1:
+      strcat(commands, "B");
+      break;
+    case 2:
+      strcat(commands, "C");
+      break;
+    case 3:
+      strcat(commands, "D");
+      break;
+    default:
+      break;
+  }
+}
+
+/*  Commands Concatenation  */
+void commandsConcat(char *command) {
+  if(commands[0] == '\0') {
+    strcat(commands, command);
+  }
+  else {
+    strcat(commands, " ");
+    strcat(commands, command);
+  }
+}
+
+/*  Indirect Check  */
+void indirectCheck() {
+  if(indirectFlag == 1) {
+    commandsConcat("I");
+  }
+}
+
+/* get next two bytes */
+int getNextWord() {
+  int temp = getc(file) << 8;
+  return temp + getc(file);
+}
+
+/* Storing */
+void storing() {
+  int blockSize;
+  int blockAddr;
+  int i;
+  int c;
+  while((c = getc(file)) != EOF) {
+    if(c < 5 || (c % 2 == 0)) {
+      fprintf(stderr, "Either smaller than 5 bytes or odd number of bytes\n");
+      exit(1);
+    }
+    blockAddr = getNextWord(); 
+    blockSize = (c - 3) / 2;
+    for(i = blockAddr; i < blockAddr + blockSize; i++) {
+      container[i] = getNextWord();
+    }
+  }
+}
+
+/* Magic */
+void checkMagic() {
+  char *magic = "OBJG";
+  int c;
+  int i;
+  for(i = 0; i < 4; i++) {
+    c = getc(file);
+    if(c != magic[i]) {
+      fprintf(stderr, "Magic doesn't match");
+      exit(1);
+    }
+  }
+}
+
+/* Non-register, Non-memory Instructions */
+void nonRegNonMem() {
+  if(currentVal == 0) { /* NOP */
+    time += 1;
+    commandsConcat("NOP");
+  }
+  else if(currentVal == 1) { /* HLT */
+    PSW = 0;
+    time += 1;
+    commandsConcat("HLT");
+  }
+  else if(currentVal == 2) { /* RET */
+    if(SP == 0xFFFF) {
+      linkBit = 1;
+    }
+    jump = 1;
+    SP++;
+    if(oldPC == 0x104)
+      printf("SP: 0x%04X, value for SP: 0x%04X\n", SP, container[SP]);
+    PC = container[SP];
+    time += 2;
+    commandsConcat("RET");
+  }
+}
+
+/* get register */
+int getReg() {
+  return (currentVal >> 10) & 3;
+}
+
+/* Register Memory Reference Instructions */
+void regMem(int opcode) {
+  int regIndex = getReg();
+  int temp;
+  int temp2;
+  switch(opcode) {
+    case 1: /* ADD */
+      temp = reg[regIndex] + container[tempPC];
+      if((reg[regIndex] & 0x8000) && (container[tempPC] & 0x8000) && !(temp & 0x8000)
+        || !(reg[regIndex] & 0x8000) && !(container[tempPC] & 0x8000) && (temp & 0x8000)){
+        linkBit = 1;
+      }
+      reg[regIndex] = temp;
+      indirectCheck();
+      commandsConcat("ADD");
+      regConcat(regIndex);
+      break; 
+    case 2: /* SUB */
+      temp2 = -1 * container[tempPC];
+      temp = reg[regIndex] - container[tempPC];
+        if((reg[regIndex] & 0x8000) && (temp2 & 0x8000) && !(temp & 0x8000)
+        || !(reg[regIndex] & 0x8000) && !(temp2 & 0x8000) && (temp & 0x8000)){
+        linkBit = 1;
+      }
+      reg[regIndex] = temp;
+      indirectCheck();
+      commandsConcat("SUB");
+      regConcat(regIndex);
+      break;
+    case 3: /* MUL */
+      temp = reg[regIndex] * container[tempPC];
+      if((temp  > 0xFFFF)
+        || ((reg[regIndex] & 0x8000) && (container[tempPC] & 0x8000) && (temp & 0x8000)
+        || !(reg[regIndex] & 0x8000) && !(container[tempPC] & 0x8000) && (temp & 0x8000))){
+        linkBit = 1;
+      }
+      indirectCheck();
+      commandsConcat("MUL");
+      regConcat(regIndex);
+      break;
+    case 4: /* DIV */
+      if(container[tempPC] == 0) {
+        linkBit = 1;
+      } else {
+        reg[regIndex] = reg[regIndex] / container[tempPC];
+      }
+      indirectCheck();
+      commandsConcat("DIV");
+      regConcat(regIndex);
+      break;
+    case 5: /* AND */
+      
+      reg[regIndex] = reg[regIndex] & container[tempPC];
+      indirectCheck();
+      commandsConcat("AND");
+      regConcat(regIndex);
+      break;
+    case 6: /* OR */
+      reg[regIndex] = reg[regIndex] | container[tempPC];
+      indirectCheck();
+      commandsConcat("OR");
+      regConcat(regIndex);
+      break;
+    case 7: /* XOR */
+      reg[regIndex] = reg[regIndex] ^ container[tempPC];
+      indirectCheck();
+      commandsConcat("XOR");
+      regConcat(regIndex);
+      break;
+    case 8: /* LD */
+      reg[regIndex] = container[tempPC];
+      indirectCheck();
+      commandsConcat("LD");
+      regConcat(regIndex);
+      break;
+    case 9: /* ST */
+      container[tempPC] = reg[regIndex];
+      indirectCheck();
+      commandsConcat("ST");
+      regConcat(regIndex);
+      break;
+  }
+  time += 2;
+}
+
+/* get device */
+int getDevice() {
+  return (currentVal >> 3) & 0x007F;
+}
+
+/* IOT */
+void IOT() {
+  int regIndex = getReg();
+  int device = getDevice();
+  int temp;
+  if(device == 3) { /* IOT 3 */
+    temp = getchar();
+    /* An EOF on stdin should cause the register to be set to 0xFFFF */
+    if(temp == EOF) {
+      reg[regIndex] = 0xFFFF;
+    } else {
+      reg[regIndex] = temp;
+    }
+    time += 1;
+    commandsConcat("IOT 3");
+  }
+  else if(device == 4) { /* IOT 4 */
+    temp = reg[regIndex] & 0x00FF;
+    putchar(temp);
+    time += 1;
+    commandsConcat("IOT 4");
+  }
+}
+
+/* Non-register Memory Reference Instructions */
+void nonRegMem(int opcode) {
+  int restOfOpcode = getReg(); /* same spot as register */
+  if(opcode == 11) {
+    switch(restOfOpcode) {
+      case 0: /* ISZ */
+        container[tempPC] = (container[tempPC] + 1) & 0xFFFF;
+
+        if(container[tempPC] == 0) {
+          PC = (PC + 1) & 0xFFFF; 
+        }
+        time += 3;
+        indirectCheck();
+        commandsConcat("ISZ");
+        printIfVerbose();
+        break;
+      case 1: /* JMP */
+        PC = tempPC;
+        jump = 1;
+        time += 1;
+        indirectCheck();
+        commandsConcat("JMP");
+        printIfVerbose();
+        break;
+      case 2: /* CALL */
+        if(SP < SPL) {
+          fprintf(stderr, "Stack Pointer = 0x%04X; Stack Limit = 0x%04X\n", SP, SPL);
+          commandsConcat("CALL Stack Overflow");
+          PSW = 0;
+          printIfVerbose();
+          exit(1);
+        } 
+        jump = 1;
+        container[SP] = PC + 1; 
+        SP--;
+        time += 2;
+        indirectCheck();
+        commandsConcat("CALL");
+        time += 2;
+        printIfVerbose();
+        PC = tempPC;
+        break;
+      default:
+        fprintf(stderr, "Shouldn't be here.");
+        break;
+    }
+  }
+  else if(opcode == 12) {
+    switch(restOfOpcode) {
+      case 0: /* PUSH */
+        if(SP < SPL) {
+          fprintf(stderr, "Stack Pointer = 0x%04X; Stack Limit = 0x%04X\n", SP, SPL);
+          commandsConcat("PUSH Stack Overflow");
+          PSW = 0;
+          time += 2;
+          printIfVerbose();
+          exit(1);
+        }
+        container[SP] = container[tempPC];
+        SP--;
+        time += 3;
+        commandsConcat("PUSH");
+        printIfVerbose();
+        break;
+      case 1: /* POP */
+        if(SP == 0xFFFF) {
+          fprintf(stderr, "SP cannot be lower than SPL");
+          exit(1);
+        }
+        SP++;
+        container[tempPC] = container[SP];
+        time += 3;
+        commandsConcat("POP");
+        printIfVerbose();
+        break;
+      default:
+        fprintf(stderr, "Shouldn't be here.");
+        break;
+    }
+  }
+}
+
+/* Register-to-Register Instructions */
+void regToReg() {
+  int subcode = (currentVal >> 9) & 7;
+  int i = (currentVal >> 6) & 7;
+  if(i == 4) {
+    jump = 1;
+  }
+  int j = (currentVal >> 3) & 7;
+  int k = currentVal & 7;
+  int temp;
+  switch(subcode) {
+    case 0: /* MOD */
+      if(reg[k] == 0) {
+        linkBit = 1;
+      } else {
+        reg[i] = reg[j] % reg[k];
+      }
+      commandsConcat("MOD");
+      break;
+    case 1: /* ADD */
+      reg[i] = reg[j] + reg[k];
+      if((reg[j] & 0x8000) && (reg[k] & 0x8000) && !(reg[i] & 0x8000)
+        || !(reg[j] & 0x8000) && !(reg[k] & 0x8000) && (reg[i] & 0x8000)){
+        linkBit = 1;
+      }
+      commandsConcat("ADD");
+      break;
+    case 2: /* SUB */
+      temp = -1 * reg[k]; 
+      reg[i] = reg[j] + temp;
+      if((reg[j] & 0x8000) && (reg[k] & 0x8000) && !(reg[i] & 0x8000)
+        || !(reg[j] & 0x8000) && !(reg[k] & 0x8000) && (reg[i] & 0x8000)){
+        linkBit = 1;
+      }
+      commandsConcat("SUB");
+      break;
+    case 3: /* MUL */
+      reg[i] = reg[j] * reg[k];
+      if((reg[j] * reg[k] > 0xFFFF)
+        || ((reg[j] & 0x8000) && (reg[k] & 0x8000) && (reg[i] & 0x8000)
+        || !(reg[j] & 0x8000) && !(reg[k] & 0x8000) && (reg[i] & 0x8000))){
+        linkBit = 1;
+      }
+      commandsConcat("MUL");
+      break;
+    case 4: /* DIV */
+      if(reg[k] == 0) {
+        linkBit = 1;
+      } else {
+        reg[i] = reg[j] / reg[k];
+      }
+      commandsConcat("DIV");
+      break;
+    case 5: /* AND */
+      reg[i] = reg[j] & reg[k];
+      commandsConcat("AND");
+      break;
+    case 6: /* OR */
+      reg[i] = reg[j] | reg[k];
+      commandsConcat("OR");
+      
+      break;
+    case 7: /* XOR */
+      reg[i] = reg[j] ^ reg[k];
+      commandsConcat("XOR");
+      break; 
+  }
+}
+
+/* Non-memory Register */
+void nonMemReg() {
+  int regIndex = getReg();
+  reg[regIndex] = reg[regIndex] & 0xFFFF;
+  if((currentVal & 0x0200) != 0) { /* SM */
+    if((reg[regIndex] & 0x8000) != 0) {
+      skipFlag = 1;
+    }
+    commandsConcat("SM");
+    regConcat(regIndex);
+  }
+  if((currentVal & 0x0100) != 0) { /* SZ */
+    if(reg[regIndex] == 0 && skipFlag == 0) {
+      skipFlag = 1;
+    }
+    commandsConcat("SZ");
+    regConcat(regIndex);
+  }
+  if((currentVal & 0x0080) != 0) { /* SNL */
+    if(linkBit) {
+      skipFlag = 1;
+    }
+    if(oldPC == 0x15E) {
+      printf("linkBit: %d, skipFlag: %d\n", linkBit, skipFlag);
+    }
+    commandsConcat("SNL");
+  }
+  if((currentVal & 0x0040) != 0) { /* RSS */
+    skipFlag = (~skipFlag) & 1;
+    commandsConcat("RSS");
+  }
+  if((currentVal & 0x0020) != 0) { /* CL */
+    regsFunction(0, 0, 3, 2, regIndex);
+    reg[regIndex] = 0;
+    commandsConcat("CL");
+    regConcat(regIndex);
+  }
+  if((currentVal & 0x0010) != 0) { /* CLL */
+    linkBit = 0;
+    commandsConcat("CLL");
+  }
+  if((currentVal & 0x0008) != 0) { /* CM */
+    reg[regIndex] = (~reg[regIndex]) & 0xFFFF;
+    commandsConcat("CM");
+    regConcat(regIndex);
+  }
+  if((currentVal & 0x0004) != 0) { /* CML */
+    linkBit = (~linkBit) & 1;
+    commandsConcat("CML");
+  }
+  if((currentVal & 0x0002) != 0) { /* DC */
+    if(reg[regIndex] == 0x8000) {
+      linkBit = 1;
+    }
+    regsFunction(0, 0, 2, 3, regIndex);
+    reg[regIndex] = (reg[regIndex] - 1) & 0xFFFF;
+    regsFunction(reg[regIndex], 0, 3, 2, regIndex);
+    commandsConcat("DC");
+    regConcat(regIndex);
+  }
+  if((currentVal & 0x0001) != 0) { /* IN */
+    if(reg[regIndex] == 0x7FFF || reg[regIndex] == 0xFFFF) {
+      linkBit = 1;
+    }
+    reg[regIndex] = (reg[regIndex] + 1) & 0xFFFF;
+    commandsConcat("IN");
+    regConcat(regIndex);
+  }
+}
+
+int main(int argc, char *argv[]) {
+  int opcode;
+  int EP;
+  int c;
+  if(strcmp(argv[1], "-v") == 0) {
+    verboseFlag = 1;
+    file = fopen(argv[2], "r");
+    if(file == NULL) {
+      fprintf(stderr, "Cannot open %s\n", argv[2]);
+      exit(1);
+    }
+  } else {
+    verboseFlag = 0;
+    file = fopen(argv[1], "r");
+    if(file == NULL) {
+      fprintf(stderr, "Cannot open %s\n", argv[1]);
+      exit(1);
+    }
+  }
+  
+  /* pre storing */
+  checkMagic();
+  EP = getNextWord();
+  /* actual sorting */
+  storing();
+  PC = EP;
+  PSW = 1;
+  while(PSW != 0)  {
+    oldPC = PC;
+    commands[0] = '\0';
+    regs[0] = '\0';
+    indirectFlag = 0;
+    skipFlag = 0;
+    jump = 0;
+    currentVal = container[PC];
+    opcode = findOpcode(currentVal);
+    if(opcode == 0) {
+      nonRegNonMem();
+      printIfVerbose();
+    }
+    else if(opcode >= 1 && opcode <= 9) {
+      if((currentVal & 0x0100) != 0) { /* current page */
+        tempPC = (PC & 0xFF00) + (currentVal & 0x00FF);
+      }
+      else {
+        tempPC = currentVal & 0x00FF;
+      }
+      if((currentVal & 0x0200) != 0) { /* indirect */
+        tempPC = container[tempPC];
+        indirectFlag = 1;
+        time++;
+      }
+      regMem(opcode);
+      currentVal = container[PC];
+      printIfVerbose();
+    }
+    else if(opcode == 10) {
+      IOT();
+      printIfVerbose();
+    }
+    else if(opcode == 11 || opcode == 12) {
+      if((currentVal & 0x0100) != 0) { /* current page */
+        tempPC = (PC & 0xFF00) + (currentVal & 0x00FF);
+      }
+      else {
+        tempPC = currentVal & 0x00FF;
+      }
+      if((currentVal & 0x0200) != 0) { /* indirect */
+        tempPC = container[tempPC];
+        indirectFlag = 1;
+        time += 1;
+      }
+      currentVal = container[PC];
+      nonRegMem(opcode);
+    }
+    else if(opcode == 14) {
+      regToReg();
+      time += 1;
+      printIfVerbose();
+    }
+    else if(opcode == 15) {
+      nonMemReg();
+      time += 1;
+      printIfVerbose();
+    }
+    if(skipFlag) {
+      PC = (PC + 1) & 0xFFFF;
+    }
+    if(!jump) {
+      PC = (PC + 1) & 0xFFFF;
+    }
+    if(time > 691 && linkBit == 1) {
+      printf("time: %lld, PC: 0x%04X\n", time, PC);
+    }
+  }
+  fclose(file);
+  return 0;
+}
